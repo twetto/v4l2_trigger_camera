@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>v4l2_trigger_camera</name>
+  <version>0.1.0</version>
+  <description>
+    Minimal V4L2 MJPEG publisher for a hardware-triggered global-shutter UVC
+    camera. Publishes camera-native JPEG bytes as CompressedImage without a
+    decode/re-encode round trip, and stamps frames from the GPIO trigger rather
+    than the coarser V4L2 buffer timestamp.
+  </description>
+
+  <maintainer email="alarm@example.com">alarm</maintainer>
+  <license>BSD</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>rtimulib_ros2</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
