@@ -41,6 +41,16 @@ Rather than sit there with the topic advertised and nothing published, the node
 exits so a respawning launch restarts it. Pair with a udev symlink, because
 re-enumeration renumbers `/dev/video*`.
 
+**A frame drought is fatal too.** ENODEV is not the only way this breaks. A USB
+glitch can leave the device open and enumerated while it silently delivers
+nothing: `poll()` just times out, no error is ever raised, and the node would
+warn forever with the topic advertised and dead. That happened in practice after
+a run of USB re-enumerations, and only a manual restart cleared it. So
+`no_frame_timeout_sec`, default 10 s, treats a sustained drought as fatal and
+lets the respawn re-run the device setup, which does clear it. The clock starts
+at stream start rather than at the first frame, because the observed failure was
+a node that opened the device cleanly and then never received anything at all.
+
 ## Known issues
 
 - Manual exposure does not appear to take effect; the camera runs its own

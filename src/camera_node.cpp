@@ -70,6 +70,7 @@ public:
 
     use_trigger_stamp_ = declare_parameter<bool>("use_trigger_stamp", true);
     trigger_max_delay_ms_ = declare_parameter<double>("trigger_max_delay_ms", 50.0);
+    no_frame_timeout_ = declare_parameter<double>("no_frame_timeout_sec", 10.0);
     const auto stats_every = declare_parameter<int>("stats_every_frames", 300);
     stats_every_ = std::max<int64_t>(1, stats_every);
 
@@ -101,6 +102,10 @@ public:
         });
     }
 
+    //  Start the drought clock at stream start, not at first frame: the failure
+    //  seen in practice was a node that opened the device cleanly and then never
+    //  received anything at all.
+    last_frame_ = std::chrono::steady_clock::now();
     camera_->start(static_cast<uint32_t>(std::max<int64_t>(1, buffer_count)));
     RCLCPP_INFO(
       get_logger(), "Capturing %ux%u MJPEG from %s, trigger_mode=%s, stamp=%s",
@@ -279,9 +284,28 @@ private:
           RCLCPP_WARN_THROTTLE(
             get_logger(), *get_clock(), 2000,
             "no frame for 500 ms; is the trigger running?");
+
+          //  A USB glitch can leave the device open and enumerated but silently
+          //  delivering nothing. That never raises ENODEV, so the error path
+          //  above never fires and the node would warn forever with the topic
+          //  advertised and dead - which is exactly how this failed in practice.
+          //  Treat a sustained frame drought as fatal and let the launch respawn
+          //  re-run the device setup, which is what actually clears it.
+          const auto dry =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - last_frame_).count();
+          if (no_frame_timeout_ > 0.0 && dry > no_frame_timeout_) {
+            RCLCPP_ERROR(
+              get_logger(),
+              "no frames for %.1f s though the device is open; shutting down to respawn",
+              dry);
+            running_ = false;
+            rclcpp::shutdown();
+            return;
+          }
         }
         continue;
       }
+      last_frame_ = std::chrono::steady_clock::now();
 
       const auto ros_now = now();
       const auto v4l2_time = monotonicToRos(frame.timestamp, ros_now);
@@ -354,6 +378,8 @@ private:
   std::string frame_id_;
   bool use_trigger_stamp_{true};
   double trigger_max_delay_ms_{50.0};
+  double no_frame_timeout_{10.0};
+  std::chrono::steady_clock::time_point last_frame_{};
   int64_t stats_every_{300};
 
   bool checked_jpeg_{false};
