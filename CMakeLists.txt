@@ -9,10 +9,14 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(rtimulib_ros2 REQUIRED)
+# libjpeg-turbo: decode MJPEG to mono8 in-process, see decodeGray() in camera_node.cpp
+find_package(JPEG REQUIRED)
 
 add_executable(camera_node src/camera_node.cpp)
 target_include_directories(camera_node PRIVATE src)
 ament_target_dependencies(camera_node rclcpp sensor_msgs rtimulib_ros2)
+target_link_libraries(camera_node ${JPEG_LIBRARIES})
+target_include_directories(camera_node PRIVATE ${JPEG_INCLUDE_DIR})
 
 install(TARGETS camera_node
   DESTINATION lib/${PROJECT_NAME})

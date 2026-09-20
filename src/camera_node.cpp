@@ -13,10 +13,79 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/compressed_image.hpp>
+#include <sensor_msgs/msg/image.hpp>
 
 #include <rtimulib_ros2/msg/camera_trigger.hpp>
 
 #include "v4l2_device.hpp"
+
+#include <cstdio>
+#include <csetjmp>
+extern "C" {
+#include <jpeglib.h>
+}
+
+namespace {
+
+//  Decoding here rather than in a separate relay node is what makes the VIO
+//  pipeline affordable. The camera can only deliver 58.8 Hz as MJPEG -- its
+//  YUYV modes top out at 10 fps and it offers no GREY at all -- so the decode
+//  has to happen somewhere. Doing it in this process means the downstream node
+//  gets mono8 directly, and we drop a Python interpreter, a second DDS hop and
+//  two copies of every frame.
+//
+//  scale_denom uses libjpeg's DCT scaling: the image is scaled during the
+//  inverse DCT and the full-size result is never materialised, so decoding to
+//  half size costs far less than decoding then resizing.
+struct JpegErrorMgr {
+  jpeg_error_mgr pub;
+  jmp_buf setjmp_buffer;
+};
+
+void jpegErrorExit(j_common_ptr cinfo)
+{
+  auto * err = reinterpret_cast<JpegErrorMgr *>(cinfo->err);
+  longjmp(err->setjmp_buffer, 1);
+}
+
+//  Returns false on a malformed frame rather than aborting: a single corrupt
+//  JPEG should drop one frame, not take down the camera node.
+bool decodeGray(
+  const unsigned char * data, size_t size, unsigned scale_denom,
+  std::vector<uint8_t> & out, unsigned & w, unsigned & h)
+{
+  jpeg_decompress_struct cinfo;
+  JpegErrorMgr jerr;
+  cinfo.err = jpeg_std_error(&jerr.pub);
+  jerr.pub.error_exit = jpegErrorExit;
+  if (setjmp(jerr.setjmp_buffer)) {
+    jpeg_destroy_decompress(&cinfo);
+    return false;
+  }
+  jpeg_create_decompress(&cinfo);
+  jpeg_mem_src(&cinfo, data, size);
+  if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
+    jpeg_destroy_decompress(&cinfo);
+    return false;
+  }
+  cinfo.out_color_space = JCS_GRAYSCALE;
+  cinfo.scale_num = 1;
+  cinfo.scale_denom = scale_denom;
+  cinfo.dct_method = JDCT_IFAST;
+  jpeg_start_decompress(&cinfo);
+  w = cinfo.output_width;
+  h = cinfo.output_height;
+  out.resize(static_cast<size_t>(w) * h);
+  while (cinfo.output_scanline < cinfo.output_height) {
+    JSAMPROW row = out.data() + static_cast<size_t>(cinfo.output_scanline) * w;
+    jpeg_read_scanlines(&cinfo, &row, 1);
+  }
+  jpeg_finish_decompress(&cinfo);
+  jpeg_destroy_decompress(&cinfo);
+  return true;
+}
+
+}  // namespace
 
 namespace
 {
@@ -72,6 +141,21 @@ public:
     trigger_max_delay_ms_ = declare_parameter<double>("trigger_max_delay_ms", 50.0);
     no_frame_timeout_ = declare_parameter<double>("no_frame_timeout_sec", 10.0);
     const auto stats_every = declare_parameter<int>("stats_every_frames", 300);
+    //  Publish decoded mono8 alongside the JPEG passthrough. The compressed
+    //  topic is unchanged and still carries the camera's original bytes, so
+    //  remote visualisation and bag recording are unaffected.
+    publish_raw_ = declare_parameter<bool>("publish_raw", true);
+    //  libjpeg only supports integer DCT scaling ratios; 2 gives 640x400 from
+    //  this camera's 1280x800, which is what the VIO config expects.
+    raw_scale_denom_ = declare_parameter<int>("raw_scale_denom", 2);
+    if (raw_scale_denom_ != 1 && raw_scale_denom_ != 2 &&
+      raw_scale_denom_ != 4 && raw_scale_denom_ != 8)
+    {
+      RCLCPP_WARN(
+        get_logger(), "raw_scale_denom %d is not 1/2/4/8; falling back to 2",
+        raw_scale_denom_);
+      raw_scale_denom_ = 2;
+    }
     stats_every_ = std::max<int64_t>(1, stats_every);
 
     camera_ = std::make_unique<V4L2Device>(
@@ -88,6 +172,12 @@ public:
 
     image_pub_ = create_publisher<sensor_msgs::msg::CompressedImage>(
       "image/compressed", rclcpp::SensorDataQoS());
+    if (publish_raw_) {
+      //  Sensor-data QoS: the consumer is a VIO node that always wants the
+      //  newest frame, and a late frame is worth less than a dropped one.
+      raw_pub_ = create_publisher<sensor_msgs::msg::Image>(
+        "image_raw", rclcpp::SensorDataQoS());
+    }
     info_pub_ = create_publisher<sensor_msgs::msg::CameraInfo>(
       "camera_info", rclcpp::SensorDataQoS());
 
@@ -210,8 +300,10 @@ private:
   {
     if (window_delays_.empty()) {
       RCLCPP_INFO(
-        get_logger(), "%lu frames, %lu dropped | no trigger matches in window",
-        static_cast<unsigned long>(frames_), static_cast<unsigned long>(dropped_));
+        get_logger(),
+        "%lu frames, %lu dropped, %lu decode_err | no trigger matches in window",
+        static_cast<unsigned long>(frames_), static_cast<unsigned long>(dropped_),
+        static_cast<unsigned long>(decode_errors_));
       return;
     }
 
@@ -352,6 +444,33 @@ private:
       msg->data.assign(frame.data, frame.data + frame.size);
       image_pub_->publish(std::move(msg));
 
+      if (publish_raw_) {
+        unsigned rw = 0, rh = 0;
+        if (decodeGray(
+            static_cast<const unsigned char *>(frame.data), frame.size,
+            static_cast<unsigned>(raw_scale_denom_), gray_, rw, rh))
+        {
+          auto raw = std::make_unique<sensor_msgs::msg::Image>();
+          raw->header.stamp = stamp;          // same trigger-exact stamp
+          raw->header.frame_id = frame_id_;
+          raw->height = rh;
+          raw->width = rw;
+          raw->encoding = "mono8";
+          raw->is_bigendian = 0;
+          raw->step = rw;
+          raw->data.assign(gray_.begin(), gray_.end());
+          raw_pub_->publish(std::move(raw));
+        } else {
+          if (decode_errors_++ % 100 == 0) {
+            RCLCPP_WARN(
+              get_logger(),
+              "MJPEG decode failed (%lu so far); /camera/image_raw will be silent "
+              "while /camera/image/compressed keeps publishing",
+              static_cast<unsigned long>(decode_errors_));
+          }
+        }
+      }
+
       sensor_msgs::msg::CameraInfo info;
       info.header.stamp = stamp;
       info.header.frame_id = frame_id_;
@@ -369,6 +488,11 @@ private:
 
   std::unique_ptr<V4L2Device> camera_;
   rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr image_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr raw_pub_;
+  bool publish_raw_{true};
+  int raw_scale_denom_{2};
+  std::vector<uint8_t> gray_;       // reused across frames; resize is a no-op
+  uint64_t decode_errors_{0};
   rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr info_pub_;
   rclcpp::Subscription<rtimulib_ros2::msg::CameraTrigger>::SharedPtr trigger_sub_;
 

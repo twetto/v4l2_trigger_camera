@@ -19,6 +19,11 @@ def generate_launch_description():
         DeclareLaunchArgument("exposure", default_value="10"),
         DeclareLaunchArgument("gain", default_value="0"),
         DeclareLaunchArgument("trigger_mode", default_value="true"),
+        # camera_node decodes MJPEG to mono8 in-process; raw_scale_denom is
+        # libjpeg's DCT scaling ratio (1/2/4/8), so 2 -> 640x400, 4 -> 320x200.
+        # The VIO calibration must match whatever this produces.
+        DeclareLaunchArgument("publish_raw", default_value="true"),
+        DeclareLaunchArgument("raw_scale_denom", default_value="2"),
     ]
 
     return LaunchDescription(args + [
@@ -49,6 +54,10 @@ def generate_launch_description():
                 "use_trigger_stamp": True,
                 "trigger_max_delay_ms": 50.0,
                 "stats_every_frames": 300,
-            }],
+            
+                "publish_raw": ParameterValue(
+                    LaunchConfiguration("publish_raw"), value_type=bool),
+                "raw_scale_denom": ParameterValue(
+                    LaunchConfiguration("raw_scale_denom"), value_type=int),}],
         ),
     ])
