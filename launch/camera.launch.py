@@ -24,6 +24,21 @@ def generate_launch_description():
         # The VIO calibration must match whatever this produces.
         DeclareLaunchArgument("publish_raw", default_value="true"),
         DeclareLaunchArgument("raw_scale_denom", default_value="2"),
+        # auto picks the UC-580 on CSI when its media device exists, else the
+        # UVC camera at `device`; both present is an error. The arguments below
+        # apply to the CSI source only.
+        DeclareLaunchArgument("camera_source", default_value="auto"),
+        # 640x400 is the sensor's 2x2 binned mode, the only one that follows
+        # every 59 Hz rig pulse on one CSI lane.
+        DeclareLaunchArgument("csi_width", default_value="640"),
+        DeclareLaunchArgument("csi_height", default_value="400"),
+        DeclareLaunchArgument("jpeg_quality", default_value="80"),
+        DeclareLaunchArgument("auto_exposure", default_value="true"),
+        # mean: hold mean brightness; gradient: maximise the gradient metric of
+        # Zhang et al. (ICRA 2017), adapted to the linear sensor.
+        DeclareLaunchArgument("ae_mode", default_value="mean"),
+        DeclareLaunchArgument("csi_exposure", default_value="300"),
+        DeclareLaunchArgument("csi_gain", default_value="32"),
     ]
 
     return LaunchDescription(args + [
@@ -58,6 +73,16 @@ def generate_launch_description():
                 "publish_raw": ParameterValue(
                     LaunchConfiguration("publish_raw"), value_type=bool),
                 "raw_scale_denom": ParameterValue(
-                    LaunchConfiguration("raw_scale_denom"), value_type=int),}],
+                    LaunchConfiguration("raw_scale_denom"), value_type=int),
+                "camera_source": ParameterValue(
+                    LaunchConfiguration("camera_source"), value_type=str),
+                "csi_width": ParameterValue(LaunchConfiguration("csi_width"), value_type=int),
+                "csi_height": ParameterValue(LaunchConfiguration("csi_height"), value_type=int),
+                "jpeg_quality": ParameterValue(LaunchConfiguration("jpeg_quality"), value_type=int),
+                "auto_exposure": ParameterValue(
+                    LaunchConfiguration("auto_exposure"), value_type=bool),
+                "ae_mode": ParameterValue(LaunchConfiguration("ae_mode"), value_type=str),
+                "csi_exposure": ParameterValue(LaunchConfiguration("csi_exposure"), value_type=int),
+                "csi_gain": ParameterValue(LaunchConfiguration("csi_gain"), value_type=int),}],
         ),
     ])
