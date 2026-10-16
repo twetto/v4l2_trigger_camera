@@ -19,7 +19,9 @@
 //    brightness target and pushes exposure down.
 //
 //  On the rig trigger a write takes effect on the very next frame (measured), so
-//  this is a one-frame-delay loop: meter frame k, set frame k+1.
+//  this is a one-frame-delay loop: meter frame k, set frame k+1. A camera with
+//  more delay (UVC: 3 frames) must hold off metering until its write has landed;
+//  the caller does that, and these steps are unchanged.
 //
 //  Brightness above black is taken as proportional to exposure x gain. That was
 //  measured for exposure (+1% over 200..1797 lines) and approximately for gain
@@ -58,6 +60,19 @@ struct AutoExposureConfig
   //  anything <= exposure_max) turns it off.
   int32_t long_exposure_max{0};
   int32_t long_exposure_gain{64};   // 4x
+  //  The output's black level is multiplied by gain along with the signal. True
+  //  of the Arducam UVC camera, whose bridge applies gain after the pedestal:
+  //  the gain-g / gain-0 mean ratio was the same at two exposures (1.94 / 1.92
+  //  at g=50), while ratios of mean-above-black differed (3.77 / 2.83). False on
+  //  CSI, where the sensor's own analogue gain leaves black where it is.
+  //  target_level and the floor levels stay defined at 1x: they are compared as
+  //  signal above black, black_level, at whatever gain is in use.
+  bool black_scales_with_gain{false};
+  //  Pixels at or above this count as clipped. 255 on CSI. The Arducam UVC
+  //  camera clips at 244 at gain 0 (99.6% of an overexposed frame read exactly
+  //  244, none 255; outdoor bag vio_live_20261016-065308), so counting only 255
+  //  saw no clipping at all and the image stayed white.
+  int32_t white_level{255};
 };
 
 struct ExposureSetting
@@ -70,6 +85,12 @@ struct ExposureSetting
     return exposure_lines == o.exposure_lines && gain == o.gain;
   }
 };
+
+//  Black level of a frame taken at `gain`.
+inline double blackAt(const AutoExposureConfig & c, int32_t gain)
+{
+  return c.black_scales_with_gain ? c.black_level * gain / 16.0 : c.black_level;
+}
 
 //  Exposure in line units times gain in units of 1x.
 inline double exposureProduct(const ExposureSetting & s)
@@ -114,15 +135,27 @@ inline ExposureSetting splitExposure(
   //  Gain makes up whatever exposure could not.
   const double gain = product / static_cast<double>(s.exposure_lines) * 16.0;
   s.gain = std::clamp<int32_t>(toward(gain), c.gain_min, c.gain_max);
+  //  A darkening step smaller than one exposure unit rounds back to `from`. In
+  //  coarse units that is a dead end: on the UVC camera (100 us units) every
+  //  12% step down from exposure 9 or less rounded to no change, and a frame
+  //  99.7% clipped held exposure 9 for 47 s (bag vio_live_20261016-073136).
+  //  Darkening is what the clip override needs, so take one unit. That exceeds
+  //  max_step_ratio below exposure ~9 (2 -> 1 is 50%). Brightening is left to
+  //  round: forcing both ways would let a deadband-sized error cycle +-1.
+  if (!up && s == from && from.exposure_lines > c.exposure_min &&
+    product < exposureProduct(from))
+  {
+    s.exposure_lines = from.exposure_lines - 1;
+  }
   return s;
 }
 
 //  Mean of the pixels below 255, from the full mean (clipped counted as 255)
 //  and the clipped fraction. Exact for the metered grid, no extra pass.
-inline double unclippedMean(double mean, double saturated)
+inline double unclippedMean(double mean, double saturated, double white = 255.0)
 {
-  if (saturated >= 1.0) {return 255.0;}
-  return (mean - 255.0 * saturated) / (1.0 - saturated);
+  if (saturated >= 1.0) {return white;}
+  return (mean - white * saturated) / (1.0 - saturated);
 }
 
 //  Where clipping stands against the floor on the rest of the frame: `starved`
@@ -137,10 +170,12 @@ struct ClipFloor
   double log_to_floor;              // log(floor / unclipped), signal above black
 };
 
-inline ClipFloor clipFloor(const AutoExposureConfig & c, double mean, double saturated)
+inline ClipFloor clipFloor(
+  const AutoExposureConfig & c, double mean, double saturated, int32_t gain)
 {
   const double floor_signal = std::max(c.saturation_floor_level - c.black_level, 1.0);
-  const double clear_signal = std::max(unclippedMean(mean, saturated) - c.black_level, 1.0);
+  const double clear_signal =
+    std::max(unclippedMean(mean, saturated, c.white_level) - blackAt(c, gain), 1.0);
   return {clear_signal < floor_signal, clear_signal / c.max_step_ratio >= floor_signal,
     std::log(floor_signal / clear_signal)};
 }
@@ -163,7 +198,7 @@ inline ExposureSetting autoExposureStep(
     return splitExposure(c, exposureProduct(current), current);
   }
 
-  const double signal = std::max(mean - c.black_level, 1.0);
+  const double signal = std::max(mean - blackAt(c, current.gain), 1.0);
   const double wanted = std::max(c.target_level - c.black_level, 1.0);
   double log_err = std::log(wanted / signal);
 
@@ -177,7 +212,7 @@ inline ExposureSetting autoExposureStep(
   //
   //  Both give way to the floor on the unclipped pixels (clipFloor): a light
   //  source clips at any exposure, and chasing it only blacks out the rest.
-  const ClipFloor f = clipFloor(c, mean, saturated);
+  const ClipFloor f = clipFloor(c, mean, saturated, current.gain);
   if (saturated > c.saturation_limit && f.may_darken) {
     log_err = std::min(log_err, -std::log(c.max_step_ratio));
   } else if (f.starved) {
@@ -196,9 +231,10 @@ inline ExposureSetting autoExposureStep(
 
 //  Metering on a subsampled grid: every `step`-th pixel in both directions.
 //  Uniform weighting; VIO cares about the whole field, not a centre subject.
+//  `saturated` is the fraction at or above `white`.
 inline void meterGray(
   const uint8_t * data, uint32_t width, uint32_t height, uint32_t stride, uint32_t step,
-  double & mean, double & saturated)
+  double & mean, double & saturated, int32_t white = 255)
 {
   uint64_t sum = 0, n = 0, sat = 0;
   for (uint32_t y = 0; y < height; y += step) {
@@ -206,7 +242,7 @@ inline void meterGray(
     for (uint32_t x = 0; x < width; x += step) {
       const uint8_t v = row[x];
       sum += v;
-      sat += (v == 255);
+      sat += (v >= white);
       n++;
     }
   }
@@ -323,13 +359,14 @@ private:
 };
 
 //  The image this sensor would give at exposure x r: linear above black, clipped
-//  at 255, and anything already clipped stays clipped.
-inline void exposureLut(double r, double black, uint8_t lut[256])
+//  at `white`, and anything already clipped stays clipped. Clipped pixels map to
+//  255, so predictedSaturation can count them whatever the white level.
+inline void exposureLut(double r, double black, uint8_t lut[256], int32_t white = 255)
 {
   for (int v = 0; v < 256; v++) {
-    if (v == 255) { lut[v] = 255; continue; }
+    if (v >= white) { lut[v] = 255; continue; }
     const double p = black + r * (static_cast<double>(v) - black);
-    lut[v] = static_cast<uint8_t>(std::clamp(std::lround(p), 0L, 255L));
+    lut[v] = p >= white ? 255 : static_cast<uint8_t>(std::clamp(std::lround(p), 0L, 255L));
   }
 }
 
@@ -363,10 +400,25 @@ inline ExposureSetting gradientExposureStep(
   gm.prepare(width, height, g);
   uint8_t lut[3][256];
   const double s = c.max_step_ratio;
-  const double ratios[3] = {1.0 / s, 1.0, s};
+  //  The exposures a step down or up would actually set. Integer controls
+  //  round, and a step that rounds to no change takes one unit, so in coarse
+  //  units the real ratio can be far from s: 1 -> 2 is 2x. The metric and the
+  //  clipping check are evaluated there. Judged at s instead, the UVC camera
+  //  cycled 1 <-> 2 every step in simulation, clipping 0% <-> 7.6%.
+  const auto candidate = [&](bool up) {
+    const double e = current.exposure_lines * (up ? s : 1.0 / s);
+    int32_t n = static_cast<int32_t>(up ? std::floor(e) : std::ceil(e));
+    if (n == current.exposure_lines) { n += up ? 1 : -1; }
+    return std::clamp(n, c.exposure_min, c.exposure_max);
+  };
+  const int32_t steps[3] = {candidate(false), current.exposure_lines, candidate(true)};
+  double ratios[3];
+  for (int i = 0; i < 3; i++) {
+    ratios[i] = static_cast<double>(steps[i]) / std::max(current.exposure_lines, 1);
+  }
   double m[3];
   for (int i = 0; i < 3; i++) {
-    exposureLut(ratios[i], c.black_level, lut[i]);
+    exposureLut(ratios[i], blackAt(c, current.gain), lut[i], c.white_level);
     m[i] = gm.evaluate(data, width, height, stride, g.step, lut[i]);
   }
   metric = m[1];
@@ -376,25 +428,27 @@ inline ExposureSetting gradientExposureStep(
   }
   //  Too much clipped: darken, whatever the metric says (see above), unless
   //  that would take the unclipped pixels below the floor.
-  if (saturated > c.saturation_limit && clipFloor(c, mean, saturated).may_darken) {
+  if (saturated > c.saturation_limit && clipFloor(c, mean, saturated, current.gain).may_darken) {
     return splitExposure(c, exposureProduct(current) / s, current);
   }
 
   ExposureSetting next = current;
-  const bool can_up = current.exposure_lines < c.exposure_max;
-  const bool can_down = current.exposure_lines > c.exposure_min;
   int best = 1;
-  if (can_up && m[2] > m[best] * g.min_improvement) { best = 2; }
+  //  Brightening is refused if the predicted clipping would pass
+  //  saturation_resume, as for gain below. Without it the step up clipped past
+  //  saturation_limit, the override took it back, and the setting alternated
+  //  every step: exposure 14 <-> 15 on the UVC camera, clipping 3.2% <-> 7.6%,
+  //  in a closed-loop simulation on an outdoor frame.
+  const bool can_up = steps[2] > current.exposure_lines;
+  const bool can_down = steps[0] < current.exposure_lines;
+  if (can_up && m[2] > m[best] * g.min_improvement &&
+    predictedSaturation(data, width, height, stride, g.step, lut[2]) <= c.saturation_resume)
+  {
+    best = 2;
+  }
   if (can_down && m[0] > m[best] * g.min_improvement) { best = 0; }
   if (best != 1) {
-    const double e = current.exposure_lines * ratios[best];
-    next.exposure_lines = std::clamp<int32_t>(
-      static_cast<int32_t>(best == 2 ? std::floor(e) : std::ceil(e)),
-      c.exposure_min, c.exposure_max);
-    if (next.exposure_lines == current.exposure_lines) {
-      next.exposure_lines += best == 2 ? 1 : -1;
-    }
-    next.exposure_lines = std::clamp(next.exposure_lines, c.exposure_min, c.exposure_max);
+    next.exposure_lines = steps[best];
     return next;
   }
 
@@ -405,13 +459,17 @@ inline ExposureSetting gradientExposureStep(
   //  pass saturation_resume. Without that check, under lamps in a dark room the
   //  raise pushed clipping over saturation_limit, the override pulled it back,
   //  and the setting changed on 98% of frames.
-  if (current.exposure_lines >= c.exposure_max && mean < g.gain_floor_level &&
-    current.gain < c.gain_max)
+  const double black = blackAt(c, current.gain);
+  if (current.exposure_lines >= c.exposure_max &&
+    mean - black < g.gain_floor_level - c.black_level && current.gain < c.gain_max)
   {
     const int32_t higher = std::min<int32_t>(
       c.gain_max, std::max<int32_t>(current.gain + 1, static_cast<int32_t>(std::floor(current.gain * s))));
     uint8_t up_lut[256];
-    exposureLut(static_cast<double>(higher) / current.gain, c.black_level, up_lut);
+    //  Gain that also scales black scales every pixel: a map about zero.
+    exposureLut(
+      static_cast<double>(higher) / current.gain, c.black_scales_with_gain ? 0.0 : c.black_level,
+      up_lut, c.white_level);
     if (predictedSaturation(data, width, height, stride, g.step, up_lut) <= c.saturation_resume) {
       next.gain = higher;
     }
@@ -421,7 +479,7 @@ inline ExposureSetting gradientExposureStep(
     //  simulation once a dim spell had raised it: the mean sat just inside.
     const int32_t lower = std::max<int32_t>(
       c.gain_min, std::min<int32_t>(current.gain - 1, static_cast<int32_t>(std::ceil(current.gain / s))));
-    const double predicted = c.black_level + (mean - c.black_level) * lower / current.gain;
+    const double predicted = c.black_level + (mean - black) * lower / current.gain;
     if (predicted > 1.1 * g.gain_floor_level) { next.gain = lower; }
   }
   return next;

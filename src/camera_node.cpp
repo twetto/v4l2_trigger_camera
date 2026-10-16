@@ -1,5 +1,8 @@
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
+#include <chrono>
+#include <cmath>
 #include <cstring>
 #include <deque>
 #include <memory>
@@ -214,6 +217,7 @@ public:
     if (!camera_->setControl(V4L2_CID_EXPOSURE_AUTO_PRIORITY, trigger_mode ? 1 : 0)) {
       RCLCPP_WARN(get_logger(), "could not set exposure_dynamic_framerate (trigger mode)");
     }
+    if (exposure_profile == "closed_loop") { setupUvcAutoExposure(exposure, gain); }
 
     image_pub_ = create_publisher<sensor_msgs::msg::CompressedImage>(
       "image/compressed", rclcpp::SensorDataQoS());
@@ -244,8 +248,8 @@ public:
     camera_->start(static_cast<uint32_t>(std::max<int64_t>(1, buffer_count)));
     RCLCPP_INFO(
       get_logger(), "Capturing %ux%u MJPEG from %s, trigger_mode=%s, stamp=%s",
-      camera_->width(), camera_->height(), device.c_str(),
-      trigger_mode ? "on" : "off", use_trigger_stamp_ ? "trigger" : "v4l2");
+      camera_->width(), camera_->height(), device.c_str(), trigger_mode ? "on" : "off",
+      !use_trigger_stamp_ ? "v4l2" : uvc_ae_ && mid_exposure_stamp_ ? "trigger+mid-exposure" : "trigger");
 
     worker_ = std::thread([this]() {captureLoop();});
   }
@@ -254,6 +258,11 @@ public:
   {
     running_ = false;
     if (worker_.joinable()) { worker_.join(); }
+    {
+      std::lock_guard<std::mutex> lock(uvc_write_mutex_);
+    }
+    uvc_write_cv_.notify_all();
+    if (uvc_writer_.joinable()) { uvc_writer_.join(); }
   }
 
 private:
@@ -279,14 +288,7 @@ private:
     auto_exposure_ = declare_parameter<bool>("auto_exposure", true);
     manual_.exposure_lines = declare_parameter<int>("csi_exposure", 300);
     manual_.gain = declare_parameter<int>("csi_gain", 32);
-    ae_.target_level = declare_parameter<double>("ae_target_level", 100.0);
-    ae_.black_level = declare_parameter<double>("ae_black_level", 16.0);
-    ae_.deadband = declare_parameter<double>("ae_deadband", 0.06);
-    ae_.correction = declare_parameter<double>("ae_correction", 0.5);
-    ae_.max_step_ratio = declare_parameter<double>("ae_max_step_ratio", 1.12);
-    ae_.saturation_limit = declare_parameter<double>("ae_saturation_limit", 0.05);
-    ae_.saturation_resume = declare_parameter<double>("ae_saturation_resume", 0.025);
-    ae_.saturation_floor_level = declare_parameter<double>("ae_saturation_floor_level", 60.0);
+    declareAeParameters(16.0, 4);
     max_skip_rate_ = declare_parameter<double>("ae_max_skip_rate", 0.005);
     ae_.gain_max = declare_parameter<int>("ae_gain_max", 255);
     //  Low light: past the full-rate ceiling and this gain, exposure may grow up
@@ -295,18 +297,6 @@ private:
     //  0 turns it off.
     const double long_exposure_ms = declare_parameter<double>("ae_long_exposure_max_ms", 33.0);
     ae_.long_exposure_gain = declare_parameter<int>("ae_long_exposure_gain", 64);
-    ae_meter_step_ = std::max<int64_t>(1, declare_parameter<int>("ae_meter_step", 4));
-    //  mean: hold mean brightness at ae_target_level. gradient: maximise the
-    //  soft-percentile gradient metric of Zhang et al. (ICRA 2017), adapted to
-    //  this linear sensor; see auto_exposure.hpp.
-    ae_mode_ = declare_parameter<std::string>("ae_mode", "mean");
-    if (ae_mode_ != "mean" && ae_mode_ != "gradient") {
-      throw std::runtime_error("ae_mode must be mean or gradient");
-    }
-    grad_.percentile = declare_parameter<double>("ae_gradient_percentile", 0.75);
-    grad_.k = declare_parameter<int>("ae_gradient_k", 5);
-    grad_.step = static_cast<uint32_t>(std::max<int64_t>(1, declare_parameter<int>("ae_gradient_step", 2)));
-    grad_.gain_floor_level = declare_parameter<double>("ae_gain_floor_level", 60.0);
     csi_latency_offset_ms_ = declare_parameter<double>("csi_latency_offset_ms", 0.883);
     csi_line_us_ = declare_parameter<double>("csi_exposure_line_us", 15.94);
     //  Trigger edge to exposure start. Unknown within [0, 0.883] ms; a constant
@@ -379,6 +369,32 @@ private:
       csi_line_us_, exposure_ceiling_, static_cast<int>(quality), enc_dev.c_str(),
       auto_exposure_ ? ae_mode_.c_str() : "off", use_trigger_stamp_ ? "trigger+mid-exposure" : "v4l2");
     worker_ = std::thread([this]() {csiLoop();});
+  }
+
+  //  Auto exposure parameters common to both sources. Only the defaults that
+  //  are properties of the camera differ.
+  void declareAeParameters(double black_level, int64_t meter_step)
+  {
+    ae_.target_level = declare_parameter<double>("ae_target_level", 100.0);
+    ae_.black_level = declare_parameter<double>("ae_black_level", black_level);
+    ae_.deadband = declare_parameter<double>("ae_deadband", 0.06);
+    ae_.correction = declare_parameter<double>("ae_correction", 0.5);
+    ae_.max_step_ratio = declare_parameter<double>("ae_max_step_ratio", 1.12);
+    ae_.saturation_limit = declare_parameter<double>("ae_saturation_limit", 0.05);
+    ae_.saturation_resume = declare_parameter<double>("ae_saturation_resume", 0.025);
+    ae_.saturation_floor_level = declare_parameter<double>("ae_saturation_floor_level", 60.0);
+    ae_meter_step_ = std::max<int64_t>(1, declare_parameter<int>("ae_meter_step", meter_step));
+    //  mean: hold mean brightness at ae_target_level. gradient: maximise the
+    //  soft-percentile gradient metric of Zhang et al. (ICRA 2017), adapted to
+    //  this linear sensor; see auto_exposure.hpp.
+    ae_mode_ = declare_parameter<std::string>("ae_mode", "mean");
+    if (ae_mode_ != "mean" && ae_mode_ != "gradient") {
+      throw std::runtime_error("ae_mode must be mean or gradient");
+    }
+    grad_.percentile = declare_parameter<double>("ae_gradient_percentile", 0.75);
+    grad_.k = declare_parameter<int>("ae_gradient_k", 5);
+    grad_.step = static_cast<uint32_t>(std::max<int64_t>(1, declare_parameter<int>("ae_gradient_step", 2)));
+    grad_.gain_floor_level = declare_parameter<double>("ae_gain_floor_level", 60.0);
   }
 
   void writeExposure(const ExposureSetting & s)
@@ -651,6 +667,168 @@ private:
     window_near_ceiling_ = false;
   }
 
+  //  ---- UVC closed-loop exposure ---------------------------------------------
+  //
+  //  The CSI controller (auto_exposure.hpp) driven through UVC controls. The
+  //  sensor is the same OV9281; what differs is the camera's bridge firmware,
+  //  measured on the rig 2026-10-15 (320x200 decode, one indoor scene):
+  //  - exposure_time_absolute is in 100 us units. Mean = 32.0 + 0.771 x exposure
+  //    for 1..55; a soft knee to ~83, flat above (the control goes to 5000 but
+  //    does nothing there). The ceiling sits at the knee so the loop's linear
+  //    model holds. The frame rate halves between 47 (17.4 ms frame interval)
+  //    and 52 (33.8 ms): uvc_ae_exposure_max 47 keeps the full rate at the cost
+  //    of 15% less light.
+  //  - the ~32 intercept is a black pedestal, not hidden exposure: spatial spread
+  //    is 8 levels at exposure 1 against 88 at 50.
+  //  - gain 0..100 is linear, 1 + 0.0189 per unit (2.89x at 100, fit at
+  //    exposure 20), and multiplies the pedestal too (black_scales_with_gain).
+  //  - a write issued right after a frame arrives lands all at once, on the
+  //    first frame triggered more than 34 and about 51 ms after that frame's
+  //    trigger: 3 frames later at 58.8 Hz (73 of 80 gain toggles), 2 at 29.7 Hz
+  //    (39 of 40; and 251 of 254 gain steps in the dark walk bag
+  //    vio_live_20261015-144842). So it is tracked in trigger time, not frames.
+  //    The loop is tuned for 1 frame of delay; at 3 its 0.5 correction would
+  //    oscillate (simulated limit cycle, +/-33%), and gradient mode, which steps
+  //    a fixed 12%, would overshoot by the frames in flight. So after a write
+  //    nothing is metered until it has landed, and the CSI steps run unchanged.
+  //
+  //  The controller works in the CSI's units: gain 16 = 1x, linear. The
+  //  conversion to the UVC control is here, at the write.
+
+  void setupUvcAutoExposure(int exposure, int gain)
+  {
+    declareAeParameters(32.0, 2);
+    ae_.black_scales_with_gain = true;
+    //  Clips at 244 at gain 0; 240 leaves room for JPEG noise around it. Held
+    //  at every gain: if gain lifts the clip to 255 (not measured), this only
+    //  counts the top 6% of the range as clipped and darkens a little early.
+    ae_.white_level = declare_parameter<int>("ae_white_level", 240);
+    ae_.exposure_min = 1;
+    ae_.exposure_max = declare_parameter<int>("uvc_ae_exposure_max", 55);
+    uvc_gain_slope_ = declare_parameter<double>("uvc_gain_slope", 0.0189);
+    uvc_gain_max_ = declare_parameter<int>("uvc_ae_gain_max", 100);
+    ae_.gain_min = 16;
+    ae_.gain_max = static_cast<int32_t>(std::floor(16.0 * (1.0 + uvc_gain_slope_ * uvc_gain_max_)));
+    ae_.long_exposure_max = 0;    // the bridge drops the frame rate by itself past the knee
+    //  Milliseconds after the metered frame's trigger. Latency: midway in the
+    //  measured (34, 51] window, which decides which frame is reported as the
+    //  first with the new setting. Settle: past its end with margin, so the
+    //  next frame metered has surely got it: 4 frames at 58.8 Hz, 2 at 29.7 Hz.
+    uvc_write_latency_ms_ = declare_parameter<double>("uvc_ae_write_latency_ms", 42.0);
+    uvc_settle_ms_ = declare_parameter<double>("uvc_ae_settle_ms", 60.0);
+    //  Stamp at mid-exposure (trigger + exposure / 2) rather than at the
+    //  trigger edge. With exposure under control it moves by up to 2.75 ms;
+    //  the edge-to-exposure-start delay that remains is a constant.
+    mid_exposure_stamp_ = declare_parameter<bool>("mid_exposure_stamp", true);
+
+    current_.exposure_lines = std::clamp(exposure, ae_.exposure_min, ae_.exposure_max);
+    current_.gain = std::clamp<int32_t>(
+      static_cast<int32_t>(std::lround(16.0 * (1.0 + uvc_gain_slope_ * gain))),
+      ae_.gain_min, ae_.gain_max);
+    uvc_ae_ = true;
+    camera_->setControl(V4L2_CID_EXPOSURE_ABSOLUTE, current_.exposure_lines);
+    camera_->setControl(V4L2_CID_GAIN, uvcGain(current_.gain));
+    uvc_requested_ = current_;
+    uvc_used_ = current_;
+    uvc_writer_ = std::thread([this]() {uvcWriterLoop();});
+    exposure_pub_ = create_publisher<v4l2_trigger_camera::msg::CameraExposure>(
+      "exposure", rclcpp::SensorDataQoS());
+    RCLCPP_INFO(
+      get_logger(), "closed-loop exposure (%s): exposure 1..%d x100us, gain 0..%d "
+      "(%.2fx), black %.1f x gain, lands %.0f ms, settle %.0f ms, stamp=%s", ae_mode_.c_str(),
+      ae_.exposure_max, uvc_gain_max_, ae_.gain_max / 16.0, ae_.black_level,
+      uvc_write_latency_ms_, uvc_settle_ms_, mid_exposure_stamp_ ? "mid-exposure" : "trigger");
+  }
+
+  int32_t uvcGain(int32_t gain16) const
+  {
+    return std::clamp<int32_t>(
+      static_cast<int32_t>(std::lround((gain16 / 16.0 - 1.0) / uvc_gain_slope_)), 0, uvc_gain_max_);
+  }
+
+  //  Hand a setting to the writer thread. `trigger_ns` is the trigger time of
+  //  the frame metered for it. A UVC control write is a USB control transfer, measured at up to 20 ms
+  //  on the rig: done inline it held back the frame being published.
+  void writeUvcExposure(const ExposureSetting & s, int64_t trigger_ns)
+  {
+    const int32_t g = uvcGain(s.gain);
+    if (s.exposure_lines == uvc_requested_.exposure_lines && g == uvcGain(uvc_requested_.gain)) {
+      return;   // rounds to the controls already requested
+    }
+    uvc_requested_ = s;
+    {
+      std::lock_guard<std::mutex> lock(uvc_write_mutex_);
+      uvc_pending_ = s;
+    }
+    uvc_write_cv_.notify_one();
+    uvc_applied_.push_back({trigger_ns + static_cast<int64_t>(uvc_write_latency_ms_ * 1e6), s});
+    uvc_next_meter_ns_ = trigger_ns + static_cast<int64_t>(uvc_settle_ms_ * 1e6);
+  }
+
+  //  Writes only the controls that changed. A newer request replaces one not
+  //  yet written; the settle hold-off keeps that rare.
+  void uvcWriterLoop()
+  {
+    int32_t written_exposure = -1, written_gain = -1;
+    while (true) {
+      ExposureSetting s;
+      {
+        std::unique_lock<std::mutex> lock(uvc_write_mutex_);
+        uvc_write_cv_.wait(lock, [this] {return uvc_pending_.has_value() || !running_;});
+        if (!running_) { return; }
+        s = *uvc_pending_;
+        uvc_pending_.reset();
+      }
+      const auto t0 = std::chrono::steady_clock::now();
+      const int32_t g = uvcGain(s.gain);
+      if (s.exposure_lines != written_exposure) {
+        if (camera_->setControl(V4L2_CID_EXPOSURE_ABSOLUTE, s.exposure_lines)) {
+          written_exposure = s.exposure_lines;
+        } else {
+          RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "exposure write failed");
+        }
+      }
+      if (g != written_gain) {
+        if (camera_->setControl(V4L2_CID_GAIN, g)) {
+          written_gain = g;
+        } else {
+          RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "gain write failed");
+        }
+      }
+      const double ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+      std::lock_guard<std::mutex> lock(uvc_write_mutex_);
+      uvc_writes_++;
+      uvc_write_ms_max_ = std::max(uvc_write_ms_max_, ms);
+    }
+  }
+
+  //  Meter the decoded frame, and step the controller once the last write has
+  //  landed. `trigger_ns` is this frame's trigger time. Returns the setting the
+  //  frame is taken to have used.
+  ExposureSetting uvcExposureStep(
+    int64_t trigger_ns, const uint8_t * gray, uint32_t w, uint32_t h,
+    double & mean, double & saturated, double & metric)
+  {
+    while (!uvc_applied_.empty() && trigger_ns > uvc_applied_.front().first) {
+      uvc_used_ = uvc_applied_.front().second;
+      uvc_applied_.pop_front();
+    }
+    if (!gray) { return uvc_used_; }
+    meterGray(
+      gray, w, h, w, static_cast<uint32_t>(ae_meter_step_), mean, saturated, ae_.white_level);
+    if (trigger_ns <= uvc_next_meter_ns_) { return uvc_used_; }
+    const ExposureSetting next = ae_mode_ == "gradient" ?
+      gradientExposureStep(
+      ae_, grad_, gradient_metric_, current_, gray, w, h, w, mean, saturated, metric) :
+      autoExposureStep(ae_, current_, mean, saturated);
+    if (!(next == current_)) {
+      current_ = next;
+      writeUvcExposure(current_, trigger_ns);
+    }
+    return uvc_used_;
+  }
+
   void applyExposure(const std::string & profile, int exposure, int gain)
   {
     //  Values come from the measured indoor sweep at 320x240; outdoor has not
@@ -660,7 +838,7 @@ private:
 
     if (profile == "manual_indoor") { exp = 10; } else if (profile == "manual_outdoor") {
       exp = 2;
-    } else if (profile == "manual_custom") {
+    } else if (profile == "manual_custom" || profile == "closed_loop") {
       exp = exposure;
     } else if (profile == "auto_validation") {
       automatic = true;
@@ -867,14 +1045,46 @@ private:
       last_seq_ = frame.sequence;
       have_last_seq_ = true;
 
+      //  Decode first: closed-loop exposure meters the decoded frame, and its
+      //  write should go out as early as possible.
+      unsigned rw = 0, rh = 0;
+      bool decoded = false;
+      if (publish_raw_ || uvc_ae_) {
+        decoded = decodeGray(
+          static_cast<const unsigned char *>(frame.data), frame.size,
+          static_cast<unsigned>(raw_scale_denom_), gray_, rw, rh);
+        if (!decoded && decode_errors_++ % 100 == 0) {
+          RCLCPP_WARN(
+            get_logger(),
+            "MJPEG decode failed (%lu so far); /camera/image_raw will be silent "
+            "while /camera/image/compressed keeps publishing",
+            static_cast<unsigned long>(decode_errors_));
+        }
+      }
       rclcpp::Time stamp = v4l2_time;
       rtimulib_ros2::msg::CameraTrigger trig;
       double delay_ms = 0.0;
       const bool matched = use_trigger_stamp_ && matchTrigger(v4l2_time, trig, delay_ms);
+
+      double mean = 0.0, saturated = 0.0, metric = 0.0;
+      ExposureSetting used;
+      if (uvc_ae_) {
+        //  Unmatched, the trigger is estimated from the running lag.
+        const int64_t trigger_ns = matched ?
+          rclcpp::Time(trig.header.stamp).nanoseconds() :
+          v4l2_time.nanoseconds() - static_cast<int64_t>(delay_estimate_ms_ * 1e6);
+        used = uvcExposureStep(
+          trigger_ns, decoded ? gray_.data() : nullptr, rw, rh, mean, saturated, metric);
+      }
+
       if (matched) {
         //  The V4L2 timestamp is quantised to a 4 ms grid on this camera; the
         //  trigger edge is the better timebase, so prefer it when available.
         stamp = trig.header.stamp;
+        if (uvc_ae_ && mid_exposure_stamp_) {
+          stamp += rclcpp::Duration::from_nanoseconds(
+            static_cast<int64_t>(0.5 * used.exposure_lines * 100e3));
+        }
         window_delays_.push_back(delay_ms);
         matched_++;
       } else if (use_trigger_stamp_) {
@@ -888,31 +1098,34 @@ private:
       msg->data.assign(frame.data, frame.data + frame.size);
       image_pub_->publish(std::move(msg));
 
-      if (publish_raw_) {
-        unsigned rw = 0, rh = 0;
-        if (decodeGray(
-            static_cast<const unsigned char *>(frame.data), frame.size,
-            static_cast<unsigned>(raw_scale_denom_), gray_, rw, rh))
-        {
-          auto raw = std::make_unique<sensor_msgs::msg::Image>();
-          raw->header.stamp = stamp;          // same trigger-exact stamp
-          raw->header.frame_id = frame_id_;
-          raw->height = rh;
-          raw->width = rw;
-          raw->encoding = "mono8";
-          raw->is_bigendian = 0;
-          raw->step = rw;
-          raw->data.assign(gray_.begin(), gray_.end());
-          raw_pub_->publish(std::move(raw));
-        } else {
-          if (decode_errors_++ % 100 == 0) {
-            RCLCPP_WARN(
-              get_logger(),
-              "MJPEG decode failed (%lu so far); /camera/image_raw will be silent "
-              "while /camera/image/compressed keeps publishing",
-              static_cast<unsigned long>(decode_errors_));
-          }
-        }
+      if (publish_raw_ && decoded) {
+        auto raw = std::make_unique<sensor_msgs::msg::Image>();
+        raw->header.stamp = stamp;          // same trigger-exact stamp
+        raw->header.frame_id = frame_id_;
+        raw->height = rh;
+        raw->width = rw;
+        raw->encoding = "mono8";
+        raw->is_bigendian = 0;
+        raw->step = rw;
+        raw->data.assign(gray_.begin(), gray_.end());
+        raw_pub_->publish(std::move(raw));
+      }
+
+      if (uvc_ae_) {
+        v4l2_trigger_camera::msg::CameraExposure ex;
+        ex.header.stamp = stamp;
+        ex.header.frame_id = frame_id_;
+        ex.exposure_lines = static_cast<uint32_t>(used.exposure_lines);
+        ex.exposure_us = static_cast<float>(used.exposure_lines * 100.0);
+        ex.analogue_gain = static_cast<uint32_t>(uvcGain(used.gain));
+        ex.exposure_measured = false;
+        ex.auto_exposure = true;
+        ex.mean_level = static_cast<float>(mean);
+        ex.saturated_fraction = static_cast<float>(saturated);
+        ex.gradient_metric = static_cast<float>(metric);
+        exposure_pub_->publish(ex);
+        window_mean_ += mean;
+        window_n_++;
       }
 
       sensor_msgs::msg::CameraInfo info;
@@ -926,6 +1139,25 @@ private:
 
       if (++frames_ % stats_every_ == 0) {
         reportStats();
+        if (uvc_ae_) {
+          uint64_t writes = 0;
+          double slowest = 0.0;
+          {
+            std::lock_guard<std::mutex> lock(uvc_write_mutex_);
+            writes = uvc_writes_;
+            slowest = uvc_write_ms_max_;
+            uvc_writes_ = 0;
+            uvc_write_ms_max_ = 0.0;
+          }
+          RCLCPP_INFO(
+            get_logger(), "  exposure %d (%.1f ms) gain %d | mean %.1f sat %.2f%% | "
+            "%lu writes, slowest %.2f ms (off the capture thread)", current_.exposure_lines,
+            current_.exposure_lines * 0.1, uvcGain(current_.gain),
+            window_n_ ? window_mean_ / window_n_ : 0.0, saturated * 100.0,
+            static_cast<unsigned long>(writes), slowest);
+          window_mean_ = 0.0;
+          window_n_ = 0;
+        }
       }
     }
   }
@@ -968,6 +1200,24 @@ private:
   uint64_t skipped_pulses_{0};
   double window_mean_{0.0};
   uint64_t window_n_{0};
+
+  //  UVC closed-loop exposure only.
+  bool uvc_ae_{false};
+  bool mid_exposure_stamp_{false};
+  double uvc_gain_slope_{0.0189};
+  int32_t uvc_gain_max_{100};
+  double uvc_write_latency_ms_{42.0};
+  double uvc_settle_ms_{60.0};
+  int64_t uvc_next_meter_ns_{0};       // meter again after this trigger time
+  ExposureSetting uvc_requested_;      // last setting handed to the writer
+  ExposureSetting uvc_used_;
+  std::deque<std::pair<int64_t, ExposureSetting>> uvc_applied_;   // lands after this trigger time
+  std::thread uvc_writer_;
+  std::mutex uvc_write_mutex_;          // guards the three below
+  std::condition_variable uvc_write_cv_;
+  std::optional<ExposureSetting> uvc_pending_;
+  uint64_t uvc_writes_{0};
+  double uvc_write_ms_max_{0.0};
 
   rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr image_pub_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr raw_pub_;

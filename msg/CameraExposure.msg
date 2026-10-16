@@ -1,8 +1,11 @@
 # Exposure settings in effect for one image, published alongside it with the
 # same header.stamp, so a consumer can pair them exactly.
 #
-# Only the CSI (UC-580) source fills this: the UVC camera runs its own exposure
-# and does not report what it used.
+# Published by the CSI (UC-580) source, and by the UVC source with
+# exposure_profile=closed_loop. For UVC, exposure_lines is the control value in
+# 100 us units, analogue_gain the UVC gain control (0-100, 0 = 1x), and both are
+# the values written, assumed to land on the first frame triggered 42 ms or more
+# after the frame metered for them (not measured per frame).
 
 std_msgs/Header header
 
