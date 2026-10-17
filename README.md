@@ -62,26 +62,17 @@ unclipped pixels would fall below `ae_saturation_floor_level` (60), and below
 that floor the controller brightens whatever the clipping. Under ceiling lights
 it now settles at an unclipped mean of 60-62.
 
-**Low light trades frame rate for exposure.** In order, the controller uses
-exposure up to the full-rate ceiling, gain up to `ae_long_exposure_gain` (4x,
-no blur), exposure up to `ae_long_exposure_max_ms` (33 ms, a motion-blur cap),
-then the rest of the gain. The frame length follows the exposure, and the
-sensor skips the pulses it cannot follow. Measured in trigger mode: frames stay
-whole and matched (0 unmatched), the delay model holds to 0.01 ms up to 24 ms,
-and the rate steps 59 -> 29.5 -> ~20 -> ~15 Hz as exposure passes ~6, ~10 and
-~17 ms. On a 5-minute walk it spent 3239 of 12157 frames past the full-rate
-ceiling and came back to 59 Hz afterwards. The cap is also kept below
-`trigger_max_delay_ms` so frames stay matchable. `gradient` mode does not use
-this yet.
-
-**The full-rate exposure ceiling is learned.** It starts at the frame length
-minus 25 lines (397 at 640x400 with minimum blanking; the driver keeps reporting
-a stale 1797). The rig's pulses are irregular -- some come 10-13 ms after the
-previous one instead of 16.9 -- so a small skip rate is accepted: per window of
-600 pulses the ceiling drops 5% when more than `ae_max_skip_rate` (0.5%) were
-skipped with exposure near it, and rises 2% after a window with none. An
-instant ratchet had chased each rare early pulse, 397 -> 222 lines in 90 s.
-Skips during long exposures are the intended trade and are not counted.
+**Exposure first, up to a blur cap, then gain**, in both modes. The cap is
+`ae_exposure_max_ms` (33 ms), a motion-blur limit, kept below
+`trigger_max_delay_ms` so frames stay matchable. Frame rate is not protected:
+the VIO needs good stamps, not a rate. The frame length follows the exposure,
+and past ~6 ms the sensor skips the pulses it cannot follow. Measured in
+trigger mode: frames stay whole and matched (0 unmatched), the delay model
+holds to 0.01 ms up to 24 ms, and the rate steps 59 -> 29.5 -> ~20 -> ~15 Hz as
+exposure passes ~6, ~10 and ~17 ms. Below ~6 ms some pulses are skipped too,
+since the rig's pulses follow IMU sample arrival and some come 10-13 ms after
+the previous one instead of 16.9; those are accepted and counted, no longer
+used to learn a full-rate ceiling.
 
 **JPEG on the VideoCore** (`jpeg_m2m.hpp`): about 2 ms a frame, with working
 `jpeg_quality` (7.2 / 14.3 / 62 KiB at 10 / 50 / 95, 640x400). GStreamer's
@@ -91,6 +82,16 @@ v4l2jpegenc ignores the quality control; driving the device directly does not.
 read as uncached: the gradient metric took 35 ms on the buffer and 1.8 ms on a
 copy, and the copy costs 0.42 ms. With it the whole node measured 11.5% of one
 core at 640x400 and 59 Hz in `mean` mode (15-21% before).
+
+**A half-resolution image drives exposure and the VIO.** Each frame is halved
+by a 2x2 box average with rounding (NEON, 0.04 ms; pixel-identical to the
+scalar loop) and published as `image_small`, 320x200, for the live VIO, which
+runs at that size for realtime. Calibrate it from the 640x400 calibration as
+f/2 and (c + 0.5)/2 - 0.5. Auto exposure meters the same small image: it is
+what the VIO sees, and the gradient metric on the full frame cost 2.2 ms. In
+`gradient` mode at 59 Hz the node went from 26.4% to 14.1% of one core, with
+`image_raw` (640x400, 256 kB a frame) also built only while something
+subscribes. The stats line reports the cost per stage (`ms/frame: ...`).
 
 **A bent ribbon corrupts rows.** With the UC-580 under the rig, 15-21% of
 frames had single rows of noise starting mid-row, depending only on the angle

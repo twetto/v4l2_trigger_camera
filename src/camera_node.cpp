@@ -17,6 +17,9 @@
 #include <unistd.h>
 
 #include <rclcpp/rclcpp.hpp>
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/compressed_image.hpp>
 #include <sensor_msgs/msg/image.hpp>
@@ -114,6 +117,30 @@ rclcpp::Time monotonicToRos(const struct timeval & mono, const rclcpp::Time & ro
     static_cast<int64_t>(mono.tv_sec) * 1000000000LL + mono.tv_usec * 1000LL;
 
   return ros_now - rclcpp::Duration::from_nanoseconds(now_mono_ns - buf_mono_ns);
+}
+
+//  2x2 box average with rounding, (a + b + c + d + 2) >> 2: each output pixel's
+//  centre lies at input 2u + 0.5. NEON does 16 output pixels per step (0.6 ms ->
+//  well under 0.1 ms at 640x400); the scalar loop gives identical results.
+void halveGray(const uint8_t * src, size_t stride, uint32_t w, uint32_t h, uint8_t * dst)
+{
+  const uint32_t ow = w / 2, oh = h / 2;
+  for (uint32_t y = 0; y < oh; y++) {
+    const uint8_t * a = src + static_cast<size_t>(2 * y) * stride;
+    const uint8_t * b = a + stride;
+    uint8_t * o = dst + static_cast<size_t>(y) * ow;
+    uint32_t x = 0;
+#if defined(__ARM_NEON)
+    for (; x + 16 <= ow; x += 16) {
+      const uint16x8_t lo = vpadalq_u8(vpaddlq_u8(vld1q_u8(a + 2 * x)), vld1q_u8(b + 2 * x));
+      const uint16x8_t hi = vpadalq_u8(vpaddlq_u8(vld1q_u8(a + 2 * x + 16)), vld1q_u8(b + 2 * x + 16));
+      vst1q_u8(o + x, vcombine_u8(vrshrn_n_u16(lo, 2), vrshrn_n_u16(hi, 2)));
+    }
+#endif
+    for (; x < ow; x++) {
+      o[x] = static_cast<uint8_t>((a[2 * x] + a[2 * x + 1] + b[2 * x] + b[2 * x + 1] + 2) >> 2);
+    }
+  }
 }
 
 bool isUvcDevice(const std::string & path)
@@ -288,15 +315,12 @@ private:
     auto_exposure_ = declare_parameter<bool>("auto_exposure", true);
     manual_.exposure_lines = declare_parameter<int>("csi_exposure", 300);
     manual_.gain = declare_parameter<int>("csi_gain", 32);
-    declareAeParameters(16.0, 4);
-    max_skip_rate_ = declare_parameter<double>("ae_max_skip_rate", 0.005);
+    declareAeParameters(16.0, 2);       // on the 320x200 image: 16000 samples, as before
     ae_.gain_max = declare_parameter<int>("ae_gain_max", 255);
-    //  Low light: past the full-rate ceiling and this gain, exposure may grow up
-    //  to ae_long_exposure_max_ms, with the sensor skipping pulses (frame rate
-    //  drops, frames stay whole and matched). The cap is a motion-blur limit.
-    //  0 turns it off.
-    const double long_exposure_ms = declare_parameter<double>("ae_long_exposure_max_ms", 33.0);
-    ae_.long_exposure_gain = declare_parameter<int>("ae_long_exposure_gain", 64);
+    //  Exposure cap, a motion-blur limit. Exposure is used up to it before any
+    //  gain; past ~6 ms the sensor skips the pulses it cannot follow, and that
+    //  frame rate is not protected (the VIO needs stamps, not a rate).
+    const double exposure_max_ms = declare_parameter<double>("ae_exposure_max_ms", 33.0);
     csi_latency_offset_ms_ = declare_parameter<double>("csi_latency_offset_ms", 0.883);
     csi_line_us_ = declare_parameter<double>("csi_exposure_line_us", 15.94);
     //  Trigger edge to exposure start. Unknown within [0, 0.883] ms; a constant
@@ -313,25 +337,25 @@ private:
     vblank_cur_ = vblank_base_;
     csi_->setControl(V4L2_CID_VBLANK, vblank_base_);
     double hts_line_us = 0.0;
-    csi_->timing(hts_line_us, exposure_ceiling_);
-    exposure_frame_limit_ = exposure_ceiling_;
-    ae_.exposure_max = exposure_ceiling_;
+    int32_t full_rate_lines = 0;     // frame length - 25 at minimum blanking
+    csi_->timing(hts_line_us, full_rate_lines);
     {
       //  Also bounded by the frame length the driver allows, and by the
       //  trigger matcher: a frame arrives 0.883 ms + exposure after its pulse,
       //  and pulses older than trigger_max_delay_ms are not considered.
       const double usable_ms = std::min(
-        long_exposure_ms, trigger_max_delay_ms_ - csi_latency_offset_ms_ - 2.0);
+        exposure_max_ms, trigger_max_delay_ms_ - csi_latency_offset_ms_ - 2.0);
       const int32_t lines = static_cast<int32_t>(std::max(0.0, usable_ms) * 1000.0 / csi_line_us_);
-      ae_.long_exposure_max = std::min<int32_t>(
-        lines, static_cast<int32_t>(csi_->height()) + vblank_max_ - 25);
-      if (long_exposure_ms > usable_ms) {
+      exposure_cap_ = std::max<int32_t>(1, std::min<int32_t>(
+          lines, static_cast<int32_t>(csi_->height()) + vblank_max_ - 25));
+      if (exposure_max_ms > usable_ms) {
         RCLCPP_WARN(
-          get_logger(), "ae_long_exposure_max_ms %.1f limited to %.1f by trigger_max_delay_ms %.1f",
-          long_exposure_ms, usable_ms, trigger_max_delay_ms_);
+          get_logger(), "ae_exposure_max_ms %.1f limited to %.1f by trigger_max_delay_ms %.1f",
+          exposure_max_ms, usable_ms, trigger_max_delay_ms_);
       }
     }
-    manual_.exposure_lines = std::clamp(manual_.exposure_lines, 1, exposure_ceiling_);
+    ae_.exposure_max = exposure_cap_;
+    manual_.exposure_lines = std::clamp(manual_.exposure_lines, 1, exposure_cap_);
     current_ = manual_;
     writeExposure(current_);
 
@@ -343,6 +367,13 @@ private:
       "image/compressed", rclcpp::SensorDataQoS());
     if (publish_raw_) {
       raw_pub_ = create_publisher<sensor_msgs::msg::Image>("image_raw", rclcpp::SensorDataQoS());
+    }
+    //  A half-resolution copy for the live VIO, which runs at 320x200 for
+    //  realtime, while image_raw keeps the full frame for recording. Each output
+    //  pixel is the rounded mean of a 2x2 block, so its centre sits at input
+    //  2u + 0.5: intrinsics scale as f/2 and (c + 0.5)/2 - 0.5.
+    if (declare_parameter<bool>("publish_small", true)) {
+      small_pub_ = create_publisher<sensor_msgs::msg::Image>("image_small", rclcpp::SensorDataQoS());
     }
     info_pub_ = create_publisher<sensor_msgs::msg::CameraInfo>(
       "camera_info", rclcpp::SensorDataQoS());
@@ -364,9 +395,9 @@ private:
     RCLCPP_INFO(
       get_logger(),
       "CSI %ux%u GREY, trigger_mode=%s (overlay), line %.3f us (timing model %.3f), "
-      "exposure ceiling %d lines, JPEG quality %d on %s, auto_exposure=%s, stamp=%s",
+      "exposure cap %d lines (full rate to ~%d), JPEG quality %d on %s, auto_exposure=%s, stamp=%s",
       csi_->width(), csi_->height(), csi_->triggerMode() ? "on" : "off", hts_line_us,
-      csi_line_us_, exposure_ceiling_, static_cast<int>(quality), enc_dev.c_str(),
+      csi_line_us_, exposure_cap_, full_rate_lines, static_cast<int>(quality), enc_dev.c_str(),
       auto_exposure_ ? ae_mode_.c_str() : "off", use_trigger_stamp_ ? "trigger+mid-exposure" : "v4l2");
     worker_ = std::thread([this]() {csiLoop();});
   }
@@ -474,24 +505,37 @@ private:
       //  Unicam buffer reads as uncached memory: the gradient metric took 35 ms
       //  a frame on it against 1.8 ms on a copy, and the memcpy is 0.4 ms. Every
       //  later step reads `pixels`.
+      //  Per-stage cost, reported as a mean per frame on the stats line.
+      auto stage_t = std::chrono::steady_clock::now();
+      const auto mark = [&](int i) {
+          const auto t = std::chrono::steady_clock::now();
+          stage_ms_[i] += std::chrono::duration<double, std::milli>(t - stage_t).count();
+          stage_t = t;
+        };
       pixels_.resize(static_cast<size_t>(csi_->stride()) * csi_->height());
       std::memcpy(pixels_.data(), frame.data, pixels_.size());
       csi_->queue(frame.index);
       const uint8_t * pixels = pixels_.data();
+      const uint32_t sw = csi_->width() / 2, sh = csi_->height() / 2;
+      small_.resize(static_cast<size_t>(sw) * sh);
+      halveGray(pixels, csi_->stride(), csi_->width(), csi_->height(), small_.data());
+      mark(0);
 
       //  Meter and set the next frame's exposure first: the next pulse can be
       //  as little as ~2 ms away, and a write that misses it lands one frame late.
+      //  Everything here runs on the half-resolution image: it is what the VIO
+      //  sees, and it is 4x fewer pixels (the gradient metric cost 2.2 ms a
+      //  frame at 640x400). Measurement and the clipping prediction must use
+      //  the same image -- mixing them made the setting cycle every step.
       double mean = 0.0, saturated = 0.0, metric = 0.0;
       meterGray(
-        pixels, csi_->width(), csi_->height(), csi_->stride(),
-        static_cast<uint32_t>(ae_meter_step_), mean, saturated);
+        small_.data(), sw, sh, sw, static_cast<uint32_t>(ae_meter_step_), mean, saturated);
       const ExposureSetting written_before = current_;
       if (auto_exposure_) {
-        ae_.exposure_max = exposure_ceiling_;
         const ExposureSetting next = ae_mode_ == "gradient" ?
           gradientExposureStep(
-          ae_, grad_, gradient_metric_, current_, pixels, csi_->width(), csi_->height(),
-          csi_->stride(), mean, saturated, metric) :
+          ae_, grad_, gradient_metric_, current_, small_.data(), sw, sh, sw,
+          mean, saturated, metric) :
           autoExposureStep(ae_, current_, mean, saturated);
         if (!(next == current_)) {
           current_ = next;
@@ -499,6 +543,7 @@ private:
         }
       }
 
+      mark(1);
       //  Match on the delay this frame's exposure predicts, then read the
       //  exposure it actually used back from the delay.
       rclcpp::Time stamp = v4l2_time;
@@ -517,7 +562,7 @@ private:
           static_cast<int64_t>((mid_exposure_offset_us_ + 0.5 * exposure_us) * 1e3));
         window_delays_.push_back(delay_ms);
         matched_++;
-        noteSkips(trig.trigger_count, used);
+        noteSkips(trig.trigger_count);
       } else {
         //  No trigger to anchor to (free-running, or unmatched): frame start is
         //  shortly after exposure ends, so back off by half the exposure.
@@ -526,6 +571,7 @@ private:
         if (use_trigger_stamp_) { unmatched_++; }
       }
 
+      mark(2);
       try {
         jpeg_->encode(pixels, csi_->stride(), jpeg);
       } catch (const std::exception & err) {
@@ -538,10 +584,14 @@ private:
       msg->header.stamp = stamp;
       msg->header.frame_id = frame_id_;
       msg->format = "jpeg";
+      mark(3);
       msg->data = jpeg;
       image_pub_->publish(std::move(msg));
+      mark(4);
 
-      if (publish_raw_) {
+      //  Full-resolution raw is for recording; building it is a 256 kB copy a
+      //  frame (0.4 ms), so only when something subscribes.
+      if (publish_raw_ && raw_pub_->get_subscription_count() > 0) {
         auto raw = std::make_unique<sensor_msgs::msg::Image>();
         raw->header.stamp = stamp;
         raw->header.frame_id = frame_id_;
@@ -558,6 +608,20 @@ private:
         }
         raw_pub_->publish(std::move(raw));
       }
+      mark(5);
+      if (small_pub_) {
+        auto small = std::make_unique<sensor_msgs::msg::Image>();
+        small->header.stamp = stamp;
+        small->header.frame_id = frame_id_;
+        small->height = sh;
+        small->width = sw;
+        small->encoding = "mono8";
+        small->is_bigendian = 0;
+        small->step = sw;
+        small->data = small_;
+        small_pub_->publish(std::move(small));
+      }
+      mark(6);
 
       v4l2_trigger_camera::msg::CameraExposure ex;
       ex.header.stamp = stamp;
@@ -578,17 +642,25 @@ private:
       info.width = csi_->width();
       info.height = csi_->height();
       info_pub_->publish(info);
+      mark(7);
 
       window_mean_ += mean;
       window_n_++;
       if (++frames_ % stats_every_ == 0) {
         reportStats();
+        const double n = static_cast<double>(stats_every_);
+        RCLCPP_INFO(
+          get_logger(), "  ms/frame: copy+halve %.2f | meter+AE %.2f | match %.2f | jpeg %.2f | "
+          "pub jpeg %.2f | raw %.2f | pub small %.2f | rest %.2f",
+          stage_ms_[0] / n, stage_ms_[1] / n, stage_ms_[2] / n, stage_ms_[3] / n,
+          stage_ms_[4] / n, stage_ms_[5] / n, stage_ms_[6] / n, stage_ms_[7] / n);
+        std::fill(std::begin(stage_ms_), std::end(stage_ms_), 0.0);
         RCLCPP_INFO(
           get_logger(),
-          "  exposure %d lines (%.2f ms) gain %d | mean %.1f sat %.2f%% | ceiling %d | "
+          "  exposure %d lines (%.2f ms) gain %d | mean %.1f sat %.2f%% | cap %d | "
           "skipped pulses %lu | jpeg %.1f KiB",
           current_.exposure_lines, current_.exposure_lines * csi_line_us_ * 1e-3, current_.gain,
-          window_n_ ? window_mean_ / window_n_ : 0.0, saturated * 100.0, exposure_ceiling_,
+          window_n_ ? window_mean_ / window_n_ : 0.0, saturated * 100.0, exposure_cap_,
           static_cast<unsigned long>(skipped_pulses_), jpeg.size() / 1024.0);
         window_mean_ = 0.0;
         window_n_ = 0;
@@ -596,75 +668,19 @@ private:
     }
   }
 
-  //  A pulse with no frame. The sensor needs roughly frame time + exposure +
-  //  2-3 ms between pulses, and the rig's pulses follow IMU sample arrival: on
-  //  the rig every skipped pulse came 11.5-13.1 ms after the last captured one,
-  //  against a 16.9 ms period. Catching all of them would cap exposure near 160
-  //  lines (2.5 ms), and an instant ratchet chased each rarer gap lower (397 ->
-  //  222 lines in 90 s). So a small skip rate is accepted -- a skipped pulse
-  //  only means no frame, the others keep their timing -- and the ceiling moves
-  //  per window of kSkipWindow pulses: down when skips exceed ae_max_skip_rate
-  //  with exposure near the ceiling, slowly back up after a window with none.
-  static constexpr uint64_t kSkipWindow = 600;
-
-  void noteSkips(uint64_t trigger_count, const ExposureSetting & used)
+  //  A pulse with no frame: the sensor needs about frame time + exposure +
+  //  2-3 ms between pulses and skips one that comes sooner. Past ~6 ms of
+  //  exposure that is every other pulse or more, and sporadically below it too,
+  //  as the rig's pulses follow IMU sample arrival (some 10-13 ms apart against
+  //  16.9). Accepted: the frames that are delivered keep their timing. Counted
+  //  for the stats line.
+  void noteSkips(uint64_t trigger_count)
   {
-    //  Past the full-rate ceiling (low light) skips are the intended trade, not
-    //  evidence about the ceiling: they are counted in the total only.
-    const bool long_exposure = used.exposure_lines > exposure_ceiling_;
-    if (long_exposure) {
-      if (have_last_trigger_count_ && trigger_count > last_trigger_count_ + 1) {
-        skipped_pulses_ += trigger_count - last_trigger_count_ - 1;
-      }
-      last_trigger_count_ = trigger_count;
-      have_last_trigger_count_ = true;
-      return;
-    }
-    if (have_last_trigger_count_ && trigger_count > last_trigger_count_) {
-      window_pulses_ += trigger_count - last_trigger_count_;
-    }
     if (have_last_trigger_count_ && trigger_count > last_trigger_count_ + 1) {
       skipped_pulses_ += trigger_count - last_trigger_count_ - 1;
-      window_skips_ += trigger_count - last_trigger_count_ - 1;
-      //  How soon after the last captured pulse did the skipped one come?
-      double gap_ms = -1.0;
-      {
-        std::lock_guard<std::mutex> lock(trigger_mutex_);
-        rclcpp::Time captured, skipped;
-        bool have_c = false, have_s = false;
-        for (const auto & t : triggers_) {
-          if (t.trigger_count == last_trigger_count_) { captured = t.header.stamp; have_c = true; }
-          if (t.trigger_count == last_trigger_count_ + 1) { skipped = t.header.stamp; have_s = true; }
-        }
-        if (have_c && have_s) { gap_ms = (skipped - captured).seconds() * 1e3; }
-      }
-      RCLCPP_INFO(
-        get_logger(), "skipped pulse %lu came %.3f ms after the last captured one "
-        "(period %.2f ms, exposure %d lines)",
-        static_cast<unsigned long>(last_trigger_count_ + 1), gap_ms, trigger_period_ms_,
-        used.exposure_lines);
-      window_near_ceiling_ |= used.exposure_lines >= exposure_ceiling_ * 9 / 10;
     }
     last_trigger_count_ = trigger_count;
     have_last_trigger_count_ = true;
-
-    if (window_pulses_ < kSkipWindow) { return; }
-    const double rate = static_cast<double>(window_skips_) / static_cast<double>(window_pulses_);
-    if (auto_exposure_ && rate > max_skip_rate_ && window_near_ceiling_) {
-      const int32_t lowered = std::max(1, exposure_ceiling_ * 95 / 100);
-      RCLCPP_WARN(
-        get_logger(), "%lu of %lu pulses skipped (%.2f%% > %.2f%%) near the ceiling; "
-        "lowering it %d -> %d lines", static_cast<unsigned long>(window_skips_),
-        static_cast<unsigned long>(window_pulses_), rate * 100.0, max_skip_rate_ * 100.0,
-        exposure_ceiling_, lowered);
-      exposure_ceiling_ = lowered;
-    } else if (window_skips_ == 0 && exposure_ceiling_ < exposure_frame_limit_) {
-      exposure_ceiling_ = std::min(
-        exposure_frame_limit_, exposure_ceiling_ + std::max(1, exposure_ceiling_ / 50));
-    }
-    window_pulses_ = 0;
-    window_skips_ = 0;
-    window_near_ceiling_ = false;
   }
 
   //  ---- UVC closed-loop exposure ---------------------------------------------
@@ -709,7 +725,6 @@ private:
     uvc_gain_max_ = declare_parameter<int>("uvc_ae_gain_max", 100);
     ae_.gain_min = 16;
     ae_.gain_max = static_cast<int32_t>(std::floor(16.0 * (1.0 + uvc_gain_slope_ * uvc_gain_max_)));
-    ae_.long_exposure_max = 0;    // the bridge drops the frame rate by itself past the knee
     //  Milliseconds after the metered frame's trigger. Latency: midway in the
     //  measured (34, 51] window, which decides which frame is reported as the
     //  first with the new setting. Settle: past its end with margin, so the
@@ -1183,15 +1198,11 @@ private:
   ExposureSetting current_;
   std::deque<Write> writes_;            // capture thread only
   std::vector<uint8_t> pixels_;         // cached copy of the current frame
-  int32_t exposure_ceiling_{397};
-  int32_t exposure_frame_limit_{397};   // frame length - 25: the ceiling never exceeds it
+  std::vector<uint8_t> small_;          // its 2x2 box average: AE input and image_small
+  int32_t exposure_cap_{397};          // lines: the blur cap, within the frame and matcher limits
   int32_t vblank_base_{22};             // frame blanking outside low light
   int32_t vblank_max_{22};
   int32_t vblank_cur_{22};              // last written; follows long exposures
-  double max_skip_rate_{0.005};
-  uint64_t window_pulses_{0};
-  uint64_t window_skips_{0};
-  bool window_near_ceiling_{false};
   double csi_latency_offset_ms_{0.883};
   double csi_line_us_{15.94};
   double mid_exposure_offset_us_{0.0};
@@ -1221,6 +1232,8 @@ private:
 
   rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr image_pub_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr raw_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr small_pub_;   // CSI only
+  double stage_ms_[8] {};               // CSI loop, summed over a stats window
   bool publish_raw_{true};
   int raw_scale_denom_{2};
   std::vector<uint8_t> gray_;       // reused across frames; resize is a no-op

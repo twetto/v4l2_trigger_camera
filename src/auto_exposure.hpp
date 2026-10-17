@@ -49,17 +49,13 @@ struct AutoExposureConfig
   //  forbade brightening for good.
   double saturation_floor_level{60.0};
   int32_t exposure_min{1};
-  int32_t exposure_max{397};        // lines; the caller keeps this at the trigger-safe ceiling
+  //  In the camera's units. The caller sets it at the motion-blur cap, not at
+  //  a frame-rate limit: past ~6 ms the UC-580 skips the trigger pulses it
+  //  cannot follow (59 -> 29.5 -> ~20 Hz at ~6.3, ~10 and ~17 ms, frames whole
+  //  and matched), and the VIO needs good stamps, not a rate.
+  int32_t exposure_max{397};
   int32_t gain_min{16};             // 16 = 1x on this sensor
   int32_t gain_max{255};
-  //  Low light: past exposure_max and long_exposure_gain, exposure grows again
-  //  up to long_exposure_max, and the sensor skips the trigger pulses it cannot
-  //  follow (measured: frames stay whole and matched; 59 -> 29.5 -> ~20 Hz as
-  //  exposure passes ~6.3, ~10 and ~17 ms). Frame rate is traded for light, gain
-  //  up to long_exposure_gain is used first because it costs no blur. 0 (or
-  //  anything <= exposure_max) turns it off.
-  int32_t long_exposure_max{0};
-  int32_t long_exposure_gain{64};   // 4x
   //  The output's black level is multiplied by gain along with the signal. True
   //  of the Arducam UVC camera, whose bridge applies gain after the pedestal:
   //  the gain-g / gain-0 mean ratio was the same at two exposures (1.94 / 1.92
@@ -98,40 +94,22 @@ inline double exposureProduct(const ExposureSetting & s)
   return static_cast<double>(s.exposure_lines) * static_cast<double>(s.gain) / 16.0;
 }
 
-//  Exposure ceiling including the low-light extension.
-inline int32_t longExposureMax(const AutoExposureConfig & c)
-{
-  return std::max(c.exposure_max, c.long_exposure_max);
-}
-
-//  Split a desired exposure x gain into the two controls, in four stages:
-//  exposure up to exposure_max, gain up to long_exposure_gain, exposure up to
-//  long_exposure_max (frame rate drops), then the rest of the gain. With the
-//  extension off the third stage is empty: exposure first, then gain. Both are
-//  integers, so rounding is done towards `from`: rounding away from it could
-//  push one frame's change past max_step_ratio (seen in simulation: 13.8%
-//  against a 12% cap).
+//  Split a desired exposure x gain into the two controls: exposure first, up to
+//  exposure_max, then gain. Both are integers, so rounding is done towards
+//  `from`: rounding away from it could push one frame's change past
+//  max_step_ratio (seen in simulation: 13.8% against a 12% cap).
 inline ExposureSetting splitExposure(
   const AutoExposureConfig & c, double product, const ExposureSetting & from)
 {
   ExposureSetting s;
-  const int32_t e_long = longExposureMax(c);
-  const int32_t g_long = std::clamp(c.long_exposure_gain, c.gain_min, c.gain_max);
   const double lo = static_cast<double>(c.exposure_min) * c.gain_min / 16.0;
-  const double hi = static_cast<double>(e_long) * c.gain_max / 16.0;
+  const double hi = static_cast<double>(c.exposure_max) * c.gain_max / 16.0;
   product = std::clamp(product, lo, hi);
   const bool up = product >= exposureProduct(from);
   const auto toward = [up](double v) {return static_cast<int32_t>(up ? std::floor(v) : std::ceil(v));};
 
-  const double exposure = product <= static_cast<double>(c.exposure_max) * g_long / 16.0 ?
-    std::min<double>(product / (c.gain_min / 16.0), c.exposure_max) :
-    std::min<double>(product / (g_long / 16.0), e_long);
-  s.exposure_lines = std::clamp<int32_t>(toward(exposure), c.exposure_min, e_long);
-  if (s.exposure_lines > c.exposure_max && s.exposure_lines < e_long) {
-    //  Third stage: gain is pinned, so it never reads as out of place below.
-    s.gain = g_long;
-    return s;
-  }
+  const double exposure = std::min<double>(product / (c.gain_min / 16.0), c.exposure_max);
+  s.exposure_lines = std::clamp<int32_t>(toward(exposure), c.exposure_min, c.exposure_max);
   //  Gain makes up whatever exposure could not.
   const double gain = product / static_cast<double>(s.exposure_lines) * 16.0;
   s.gain = std::clamp<int32_t>(toward(gain), c.gain_min, c.gain_max);
@@ -185,16 +163,9 @@ inline ClipFloor clipFloor(
 inline ExposureSetting autoExposureStep(
   const AutoExposureConfig & c, const ExposureSetting & current, double mean, double saturated)
 {
-  //  The ceiling can drop under the current exposure (a skipped pulse lowers
-  //  it). Move the excess into gain at once, whatever the brightness error: a
-  //  hold here kept exposure at 397 lines after the ceiling fell to 377, and the
-  //  sensor went on skipping pulses.
-  //  Past exposure_max is only right in the low-light stages, at gain >=
-  //  long_exposure_gain and within long_exposure_max.
-  if (current.exposure_lines > c.exposure_max &&
-    (current.exposure_lines > longExposureMax(c) ||
-    current.gain < std::clamp(c.long_exposure_gain, c.gain_min, c.gain_max)))
-  {
+  //  Past exposure_max (a start value, or a cap lowered at run time): move the
+  //  excess into gain at once, whatever the brightness error.
+  if (current.exposure_lines > c.exposure_max) {
     return splitExposure(c, exposureProduct(current), current);
   }
 
@@ -389,14 +360,10 @@ inline double predictedSaturation(
 //  One gradient-mode step. `metric` is filled with M_softperc of the frame as
 //  captured, for logging.
 inline ExposureSetting gradientExposureStep(
-  const AutoExposureConfig & config, const GradientConfig & g, GradientMetric & gm,
+  const AutoExposureConfig & c, const GradientConfig & g, GradientMetric & gm,
   const ExposureSetting & current, const uint8_t * data, uint32_t width, uint32_t height,
   uint32_t stride, double mean, double saturated, double & metric)
 {
-  //  The low-light extension is mean mode only for now; here exposure stays
-  //  within the full-rate ceiling as before.
-  AutoExposureConfig c = config;
-  c.long_exposure_max = 0;
   gm.prepare(width, height, g);
   uint8_t lut[3][256];
   const double s = c.max_step_ratio;
@@ -441,12 +408,19 @@ inline ExposureSetting gradientExposureStep(
   //  in a closed-loop simulation on an outdoor frame.
   const bool can_up = steps[2] > current.exposure_lines;
   const bool can_down = steps[0] < current.exposure_lines;
-  if (can_up && m[2] > m[best] * g.min_improvement &&
+  //  Too dark to judge: below gain_floor_level, brighten whatever the metric
+  //  says. The metric is evaluated on the 8-bit frame scaled by the step, and a
+  //  signal of 1-2 levels scales to the same values, so all three candidates
+  //  scored alike and exposure never rose (simulation: held at 300 of 2157
+  //  lines, mean 17.5).
+  const bool dark =
+    mean - blackAt(c, current.gain) < g.gain_floor_level - c.black_level;
+  if (can_up && (dark || m[2] > m[best] * g.min_improvement) &&
     predictedSaturation(data, width, height, stride, g.step, lut[2]) <= c.saturation_resume)
   {
     best = 2;
   }
-  if (can_down && m[0] > m[best] * g.min_improvement) { best = 0; }
+  if (!dark && can_down && m[0] > m[best] * g.min_improvement) { best = 0; }
   if (best != 1) {
     next.exposure_lines = steps[best];
     return next;
