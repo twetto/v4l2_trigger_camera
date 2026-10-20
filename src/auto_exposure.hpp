@@ -65,9 +65,8 @@ struct AutoExposureConfig
   //  signal above black, black_level, at whatever gain is in use.
   bool black_scales_with_gain{false};
   //  Pixels at or above this count as clipped. 255 on CSI. The Arducam UVC
-  //  camera clips at 244 at gain 0 (99.6% of an overexposed frame read exactly
-  //  244, none 255; outdoor bag vio_live_20261016-065308), so counting only 255
-  //  saw no clipping at all and the image stayed white.
+  //  camera clips at 244 at gain 0 (an overexposed frame reads 244, not 255),
+  //  so counting only 255 sees no clipping at all and the image stays white.
   int32_t white_level{255};
 };
 
@@ -115,8 +114,8 @@ inline ExposureSetting splitExposure(
   s.gain = std::clamp<int32_t>(toward(gain), c.gain_min, c.gain_max);
   //  A darkening step smaller than one exposure unit rounds back to `from`. In
   //  coarse units that is a dead end: on the UVC camera (100 us units) every
-  //  12% step down from exposure 9 or less rounded to no change, and a frame
-  //  99.7% clipped held exposure 9 for 47 s (bag vio_live_20261016-073136).
+  //  12% step down from exposure 9 or less rounds to no change, so a fully
+  //  clipped frame could never darken.
   //  Darkening is what the clip override needs, so take one unit. That exceeds
   //  max_step_ratio below exposure ~9 (2 -> 1 is 50%). Brightening is left to
   //  round: forcing both ways would let a deadband-sized error cycle +-1.

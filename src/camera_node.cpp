@@ -487,8 +487,32 @@ private:
       }
       if (r <= 0) {
         if (r == 0) {
+          //  Say which side stopped: whether triggers still arrive tells a
+          //  sensor that ignores them from a trigger that is gone.
+          double trigger_age_s = -1.0;
+          {
+            std::lock_guard<std::mutex> lock(trigger_mutex_);
+            if (have_last_trigger_) { trigger_age_s = (now() - last_trigger_time_).seconds(); }
+          }
+          const double dry =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - last_frame_).count();
           RCLCPP_WARN_THROTTLE(
-            get_logger(), *get_clock(), 2000, "no frame for 500 ms; is the trigger running?");
+            get_logger(), *get_clock(), 2000,
+            "no frame for %.1f s; last trigger message %.3f s ago (%s)", dry, trigger_age_s,
+            trigger_age_s < 0.0 ? "none received" :
+            trigger_age_s < 0.1 ? "triggers arriving: the sensor is not answering them" :
+            "triggers stopped");
+          //  As on the UVC path: a stream that stays dry is fatal, so the launch
+          //  respawn re-runs the sensor setup. The sensor can stop answering
+          //  triggers without any kernel error, and a restart clears it.
+          if (no_frame_timeout_ > 0.0 && dry > no_frame_timeout_) {
+            RCLCPP_ERROR(
+              get_logger(), "no frames for %.1f s (last trigger %.3f s ago); shutting down to respawn",
+              dry, trigger_age_s);
+            running_ = false;
+            rclcpp::shutdown();
+            return;
+          }
         }
         continue;
       }
@@ -687,7 +711,7 @@ private:
   //
   //  The CSI controller (auto_exposure.hpp) driven through UVC controls. The
   //  sensor is the same OV9281; what differs is the camera's bridge firmware,
-  //  measured on the rig 2026-10-15 (320x200 decode, one indoor scene):
+  //  as measured (320x200 decode, one indoor scene):
   //  - exposure_time_absolute is in 100 us units. Mean = 32.0 + 0.771 x exposure
   //    for 1..55; a soft knee to ~83, flat above (the control goes to 5000 but
   //    does nothing there). The ceiling sits at the knee so the loop's linear
@@ -701,8 +725,7 @@ private:
   //  - a write issued right after a frame arrives lands all at once, on the
   //    first frame triggered more than 34 and about 51 ms after that frame's
   //    trigger: 3 frames later at 58.8 Hz (73 of 80 gain toggles), 2 at 29.7 Hz
-  //    (39 of 40; and 251 of 254 gain steps in the dark walk bag
-  //    vio_live_20261015-144842). So it is tracked in trigger time, not frames.
+  //    (39 of 40). So it is tracked in trigger time, not frames.
   //    The loop is tuned for 1 frame of delay; at 3 its 0.5 correction would
   //    oscillate (simulated limit cycle, +/-33%), and gradient mode, which steps
   //    a fixed 12%, would overshoot by the frames in flight. So after a write
